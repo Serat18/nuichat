@@ -1,7 +1,7 @@
 {
   "name": "chatui",
   "version": "1.0.0",
-  "description": "OpenWebUI-like chat for OpenRouter",
+  "description": "OpenWebUI-like chat ui using nodejs and npm lol",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
