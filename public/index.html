@@ -403,6 +403,57 @@ body {
 }
 #user-input::placeholder { color: var(--text-muted); }
 
+.input-icon-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.1s, color 0.1s;
+}
+.input-icon-btn:hover { background: var(--surface-hover); color: var(--text); }
+.input-icon-btn.active { color: #7c6af7; background: rgba(124,106,247,0.12); }
+.input-icon-btn .material-icons { font-size: 20px; }
+
+#attach-dropdown {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  z-index: 50;
+  width: 140px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+}
+#attach-dropdown.open { display: block; }
+
+.attach-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: none;
+  background: none;
+  font-family: var(--font);
+  font-size: 13.5px;
+  cursor: pointer;
+  color: var(--text);
+  transition: background 0.1s;
+}
+.attach-opt:hover:not(:disabled) { background: var(--surface-hover); }
+.attach-opt:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.45; }
+.attach-opt .material-icons { font-size: 17px; }
+
 #send-btn {
   background: var(--text);
   border: none;
@@ -594,7 +645,25 @@ body {
 
   <div id="input-wrap-outer">
     <div id="input-container">
+      <div id="attach-wrap" style="position:relative;flex-shrink:0">
+        <button id="attach-btn" class="input-icon-btn" title="Attach">
+          <span class="material-icons">add</span>
+        </button>
+        <div id="attach-dropdown">
+          <button id="attach-image" class="attach-opt" disabled>
+            <span class="material-icons">image</span> Image
+          </button>
+          <button id="attach-file" class="attach-opt" disabled>
+            <span class="material-icons">description</span> File
+          </button>
+        </div>
+      </div>
+      <input type="file" id="file-input-image" accept="image/*" style="display:none">
+      <input type="file" id="file-input-file" accept=".txt,.md,.csv,.json,.pdf,.py,.js,.ts,.html,.css,.xml" style="display:none">
       <textarea id="user-input" placeholder="Ask anything" rows="1"></textarea>
+      <button id="websearch-btn" title="Web search" class="input-icon-btn">
+        <span class="material-icons">language</span>
+      </button>
       <button id="stop-btn">
         <span class="material-icons">stop</span>
       </button>
@@ -676,6 +745,14 @@ body {
 
 <script>
 let apiKey = localStorage.getItem('or_api_key') || '';
+
+const MODELSDEV_ID = {
+  openrouter:'openrouter', openai:'openai', anthropic:'anthropic', google:'google',
+  groq:'groq', deepseek:'deepseek', mistral:'mistral', together:'togetherai',
+  fireworks:'fireworks', xai:'xai', cerebras:'cerebras', perplexity:'perplexity',
+  nvidia:'nvidia', cohere:'cohere', huggingface:'huggingface', deepinfra:'deepinfra',
+};
+let modelsDevCache = null;
 let systemPrompt = localStorage.getItem('system_prompt') || 'You are a helpful assistant.';
 let allModels = JSON.parse(localStorage.getItem('or_models') || '[]');
 let conversations = JSON.parse(localStorage.getItem('conversations') || '[]');
@@ -848,7 +925,13 @@ async function loadModels() {
     if (data.models) {
       allModels = data.models;
       localStorage.setItem('or_models', JSON.stringify(allModels));
+      if (!modelsDevCache) {
+        fetch('https://models.dev/api.json').then(r => r.json()).then(d => {
+          modelsDevCache = d; updateAttachButtons();
+        }).catch(() => {});
+      }
       renderModelList();
+      updateAttachButtons();
     }
   } catch(e) { console.error(e); }
 }
@@ -871,6 +954,7 @@ function renderModelList(filter = '') {
       selectedModel = m.id;
       localStorage.setItem('selected_model', m.id);
       document.getElementById('model-label').textContent = m.id;
+      updateAttachButtons();
       closeModelDropdown();
     };
     list.appendChild(div);
@@ -914,7 +998,132 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && dropdownOpen) closeModelDropdown();
 });
 
-// ── Send ───────────────────────────────────────────────
+// ── Web search ─────────────────────────────────────────
+let webSearchEnabled = false;
+const webSearchBtn = document.getElementById('websearch-btn');
+webSearchBtn.onclick = () => {
+  webSearchEnabled = !webSearchEnabled;
+  webSearchBtn.classList.toggle('active', webSearchEnabled);
+  webSearchBtn.title = webSearchEnabled ? 'Web search ON' : 'Web search OFF';
+};
+
+async function doWebSearch(query) {
+  try {
+    const r = await fetch(`/api/websearch?q=${encodeURIComponent(query)}`);
+    const data = await r.json();
+    if (!data.results?.length) return null;
+    // Fetch top 2 results for content
+    const fetched = await Promise.allSettled(
+      data.results.slice(0, 2).map(result =>
+        fetch('/api/webfetch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: result.url }),
+        }).then(r => r.json()).then(d => ({ ...result, content: d.content || '' }))
+      )
+    );
+    const pages = fetched
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value);
+
+    // Build context block injected into system prompt
+    let context = `## Web search results for: "${query}"\n\n`;
+    // First add snippets from all results
+    data.results.forEach((r, i) => {
+      context += `### [${i+1}] ${r.title}\nURL: ${r.url}\n${r.snippet}\n\n`;
+    });
+    // Then add full page content for top 2
+    pages.forEach(p => {
+      if (p.content) context += `---\n**Full content from ${p.url}:**\n${p.content.slice(0, 6000)}\n\n`;
+    });
+    return context;
+  } catch(e) {
+    console.error('Web search failed:', e);
+    return null;
+  }
+}
+
+// ── Capability detection ────────────────────────────────
+const VISION_HINTS = ['vision','vl','pixtral','llava','bakllava','cogvlm','qwen-vl','claude','gpt-4o','gpt-4-turbo','gemini','mistral-medium','mistral-large','llama-3','phi-3','phi-4','idefics','moondream','deepseek-vl','internvl'];
+const FILE_HINTS   = ['claude','gpt-4','gemini','mistral-large','command-r'];
+
+function detectCapabilities(modelId) {
+  if (!modelId) return { vision: false, files: false };
+  const id = modelId.toLowerCase();
+  const mdKey = MODELSDEV_ID[selectedProvider];
+  if (modelsDevCache && mdKey && modelsDevCache[mdKey]?.models?.[modelId]) {
+    const m = modelsDevCache[mdKey].models[modelId];
+    const capStr = JSON.stringify(m.capabilities || m.modalities || []).toLowerCase();
+    return {
+      vision: capStr.includes('vision') || capStr.includes('image'),
+      files:  capStr.includes('file') || capStr.includes('document') || capStr.includes('pdf'),
+    };
+  }
+  return {
+    vision: VISION_HINTS.some(h => id.includes(h)),
+    files:  FILE_HINTS.some(h => id.includes(h)),
+  };
+}
+
+function updateAttachButtons() {
+  const caps = detectCapabilities(selectedModel);
+  const imgBtn  = document.getElementById('attach-image');
+  const fileBtn = document.getElementById('attach-file');
+  imgBtn.disabled  = !caps.vision;
+  fileBtn.disabled = !caps.files;
+  imgBtn.title  = caps.vision ? 'Attach image' : 'Model does not support images';
+  fileBtn.title = caps.files  ? 'Attach file'  : 'Model does not support file input';
+}
+
+// ── Attach button ────────────────────────────────────────
+let attachedFiles = [];
+
+const attachBtn = document.getElementById('attach-btn');
+const attachDropdown = document.getElementById('attach-dropdown');
+
+attachBtn.onclick = e => { e.stopPropagation(); attachDropdown.classList.toggle('open'); };
+document.addEventListener('click', e => {
+  if (!document.getElementById('attach-wrap').contains(e.target)) attachDropdown.classList.remove('open');
+});
+
+document.getElementById('attach-image').onclick = () => { attachDropdown.classList.remove('open'); document.getElementById('file-input-image').click(); };
+document.getElementById('attach-file').onclick  = () => { attachDropdown.classList.remove('open'); document.getElementById('file-input-file').click(); };
+
+function fileToBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(file);
+  });
+}
+
+async function handleFileInput(e, type) {
+  const file = e.target.files[0]; if (!file) return;
+  const base64 = await fileToBase64(file);
+  attachedFiles.push({ type, name: file.name, base64, mimeType: file.type });
+  renderAttachPreviews(); e.target.value = '';
+}
+
+document.getElementById('file-input-image').onchange = e => handleFileInput(e, 'image');
+document.getElementById('file-input-file').onchange  = e => handleFileInput(e, 'file');
+
+function renderAttachPreviews() {
+  let preview = document.getElementById('attach-preview');
+  if (!attachedFiles.length) { preview?.remove(); return; }
+  if (!preview) {
+    preview = document.createElement('div');
+    preview.id = 'attach-preview';
+    preview.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;padding:6px 14px 0;max-width:780px;margin:0 auto;';
+    document.getElementById('input-wrap-outer').prepend(preview);
+  }
+  preview.innerHTML = attachedFiles.map((f, i) => `
+    <div style="display:flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:4px 8px;font-size:12px;">
+      <span class="material-icons" style="font-size:15px">${f.type === 'image' ? 'image' : 'description'}</span>
+      <span>${escHtml(f.name)}</span>
+      <button onclick="removeAttach(${i})" style="background:none;border:none;cursor:pointer;color:var(--text-muted);padding:0;display:flex"><span class="material-icons" style="font-size:14px">close</span></button>
+    </div>`).join('');
+}
+
+window.removeAttach = i => { attachedFiles.splice(i, 1); renderAttachPreviews(); };
+
 async function sendMessage() {
   const input = document.getElementById('user-input');
   const text = input.value.trim();
@@ -926,7 +1135,24 @@ async function sendMessage() {
   if (!activeConvId) newConversation();
   const conv = getActiveConv();
 
-  conv.messages.push({ role: 'user', content: text });
+  // Build message content — multipart if attachments exist
+  let userContent;
+  if (attachedFiles.length) {
+    userContent = [{ type: 'text', text }];
+    attachedFiles.forEach(f => {
+      if (f.type === 'image') {
+        userContent.push({ type: 'image_url', image_url: { url: `data:${f.mimeType};base64,${f.base64}` } });
+      } else {
+        userContent.push({ type: 'text', text: `\n\n[File: ${f.name}]\n${atob(f.base64)}` });
+      }
+    });
+    attachedFiles = [];
+    renderAttachPreviews();
+  } else {
+    userContent = text;
+  }
+
+  conv.messages.push({ role: 'user', content: userContent });
   updateConvTitle(conv.id, text);
   saveConversations();
 
@@ -938,6 +1164,13 @@ async function sendMessage() {
   const streamEl = addMessage('assistant', '', true);
   document.getElementById('stop-btn').classList.add('visible');
 
+  // If web search enabled, search first and inject context
+  let searchContext = null;
+  if (webSearchEnabled) {
+    streamEl.innerHTML = '<span style="color:var(--text-muted);font-size:13px">🔍 Searching the web…</span>';
+    searchContext = await doWebSearch(text);
+  }
+
   abortController = new AbortController();
   let fullText = '';
 
@@ -946,7 +1179,10 @@ async function sendMessage() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages: [{ role: 'system', content: systemPrompt }, ...conv.messages],
+        messages: [
+          { role: 'system', content: searchContext ? `${systemPrompt}\n\n${searchContext}` : systemPrompt },
+          ...conv.messages
+        ],
         model: selectedModel,
         apiKey: key,
         provider: selectedProvider,
@@ -1123,6 +1359,7 @@ if (allModels.length) renderModelList();
 if (currentApiKey() || selectedProvider === 'ollama') loadModels();
 if (selectedModel) document.getElementById('model-label').textContent = selectedModel;
 else document.getElementById('model-label').textContent = 'Select model';
+updateAttachButtons();
 renderSidebar();
 renderMessages();
 </script>
