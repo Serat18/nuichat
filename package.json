@@ -1,13 +1,14 @@
 {
   "name": "nuichat",
   "version": "1.0.0",
-  "description": "OpenWebUI-like chat ui using nodejs and npm lol",
+  "description": "Chat UI for providers",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
   "dependencies": {
-    "express": "^4.22.2"
+    "express": "^4.22.2",
+    "node-html-parser": "^8.0.3"
   }
 }
