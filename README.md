@@ -1,5 +1,5 @@
 # Nuichat
-This is an Open WebUI alternative that runs on node.js and npm
+This is an Open WebUI-like alternative that runs on node.js and npm
 # How to run?
 1. Download the Repo files as zip or git clone
 2. Extract it
@@ -10,3 +10,6 @@ There are 17 availiable providers, they are OpenRouter, OpenAI, Anthropic, Googl
 But you can also use your own OpenAI compatible custom provider API key.
 # Live (usable) website
 Go to https://nuichat.onrender.com to use it without installing
+Runs on Render Free tier, so it will spin down out of inactivity.
+# Facts
+If you find things like ChatUI then don't worry, it was called ChatUI before shifting names. Also this is fully made with Claude Sonnet 4.6 (Low), and theres almost no human code.
