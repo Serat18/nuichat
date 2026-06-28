@@ -51,7 +51,7 @@ const PROVIDERS = {
     name: 'OpenRouter',
     baseURL: 'https://openrouter.ai/api/v1',
     liveModels: { path: '/models', key: 'data', idKey: 'id' },
-    extraHeaders: () => ({ 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Nuichat' }),
+    extraHeaders: () => ({ 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'ChatUI' }),
   },
   openai: {
     name: 'OpenAI',
@@ -228,6 +228,40 @@ app.get('/api/providers', (req, res) => {
   res.json(Object.entries(PROVIDERS).map(([id, p]) => ({ id, name: p.name, noAuth: !!p.noAuth })));
 });
 
+
+// Normalize message content array for each provider's expected format.
+// Frontend always sends OpenAI-style: { type:'image_url', image_url:{url:'data:mime;base64,...'} }
+// and { type:'file', file:{filename, file_data:'data:mime;base64,...'} }
+function normalizeMessages(messages, providerKey) {
+  return messages.map(msg => {
+    if (!Array.isArray(msg.content)) return msg;
+    const content = msg.content.map(part => {
+      if (part.type === 'image_url') {
+        const dataUrl = part.image_url?.url || '';
+        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (!match) return part;
+        const [, mimeType, data] = match;
+        if (providerKey === 'anthropic') {
+          // Anthropic wants: { type:'image', source:{ type:'base64', media_type, data } }
+          return { type: 'image', source: { type: 'base64', media_type: mimeType, data } };
+        }
+        // OpenAI-compatible: pass through as-is
+        return part;
+      }
+      if (part.type === 'file') {
+        const { filename, file_data } = part.file || {};
+        // All providers: inline file content as text since chat completions
+        // don't universally support file blocks. Extract text from data URL.
+        const match = file_data?.match(/^data:[^;]+;base64,(.+)$/);
+        const text = match ? Buffer.from(match[1], 'base64').toString('utf-8') : '';
+        return { type: 'text', text: `[File: ${filename}]\n${text}` };
+      }
+      return part;
+    });
+    return { ...msg, content };
+  });
+}
+
 // Chat completion with retry
 app.post('/api/chat', async (req, res) => {
   const { messages, model, apiKey, provider: providerKey, customBaseUrl } = req.body;
@@ -235,13 +269,15 @@ app.post('/api/chat', async (req, res) => {
   if (!provider) return res.status(400).json({ error: 'Unknown provider' });
   if (!apiKey && !provider.noAuth) return res.status(400).json({ error: 'API key required' });
 
+  const normalizedMessages = normalizeMessages(messages, providerKey);
+
   // Custom provider: use the user-supplied base URL
   if (provider.isCustom) {
     if (!customBaseUrl) return res.status(400).json({ error: 'Custom base URL required' });
     const headers = { 'Content-Type': 'application/json' };
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
     const chatURL = `${customBaseUrl.replace(/\/$/, '')}/chat/completions`;
-    const body = JSON.stringify({ model, messages, stream: true });
+    const body = JSON.stringify({ model, messages: normalizedMessages, stream: true });
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -282,8 +318,8 @@ app.post('/api/chat', async (req, res) => {
   let chatURL, body;
   if (provider.isAnthropic) {
     chatURL = `${provider.baseURL}/v1/messages`;
-    const sysMsg = messages.find(m => m.role === 'system');
-    const userMsgs = messages.filter(m => m.role !== 'system');
+    const sysMsg = normalizedMessages.find(m => m.role === 'system');
+    const userMsgs = normalizedMessages.filter(m => m.role !== 'system');
     body = JSON.stringify({
       model,
       max_tokens: 8096,
@@ -293,7 +329,7 @@ app.post('/api/chat', async (req, res) => {
     });
   } else {
     chatURL = `${provider.baseURL}/chat/completions`;
-    body = JSON.stringify({ model, messages, stream: true });
+    body = JSON.stringify({ model, messages: normalizedMessages, stream: true });
   }
 
   for (let attempt = 0; ; attempt++) {
@@ -375,6 +411,99 @@ app.post('/api/chat', async (req, res) => {
       }
     } catch(e) { /* client disconnected */ }
     return res.end();
+  }
+});
+
+const { parse } = require('node-html-parser');
+
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+// Convert HTML to readable plain text / markdown
+function htmlToText(html) {
+  try {
+    const root = parse(html);
+    // Remove noise
+    ['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript', 'iframe'].forEach(tag => {
+      root.querySelectorAll(tag).forEach(el => el.remove());
+    });
+    // Convert basic markdown
+    root.querySelectorAll('h1,h2,h3,h4').forEach(el => {
+      const level = '#'.repeat(parseInt(el.tagName[1]));
+      el.replaceWith(`\n${level} ${el.text.trim()}\n`);
+    });
+    root.querySelectorAll('a').forEach(el => {
+      const href = el.getAttribute('href');
+      const text = el.text.trim();
+      if (href && text) el.replaceWith(`[${text}](${href})`);
+    });
+    root.querySelectorAll('li').forEach(el => el.replaceWith(`\n- ${el.text.trim()}`));
+    root.querySelectorAll('p,br,div').forEach(el => el.replaceWith(`\n${el.text.trim()}`));
+    // Clean up
+    return root.text
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]+/g, ' ')
+      .trim()
+      .slice(0, 20000); // cap at 20k chars
+  } catch(e) {
+    return html.replace(/<[^>]+>/g, ' ').slice(0, 20000);
+  }
+}
+
+// Web fetch — fetch a URL and return as markdown text
+app.post('/api/webfetch', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const r = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(10000) });
+    const ct = r.headers.get('content-type') || '';
+    if (!r.ok) return res.status(r.status).json({ error: `HTTP ${r.status}` });
+    if (ct.includes('application/json')) {
+      const text = await r.text();
+      return res.json({ content: text.slice(0, 20000), url });
+    }
+    const html = await r.text();
+    const content = ct.includes('text/html') ? htmlToText(html) : html.slice(0, 20000);
+    res.json({ content, url });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Web search — DuckDuckGo HTML scrape, no API key needed
+app.get('/api/websearch', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+    const r = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(8000) });
+    const html = await r.text();
+    const root = parse(html);
+
+    const results = [];
+    root.querySelectorAll('.result').forEach(el => {
+      const titleEl = el.querySelector('.result__title a') || el.querySelector('a.result__a');
+      const snippetEl = el.querySelector('.result__snippet');
+      const linkEl = el.querySelector('a.result__url') || titleEl;
+      if (!titleEl) return;
+      const href = titleEl.getAttribute('href') || '';
+      // DDG wraps URLs — extract the actual URL
+      const realUrl = href.includes('uddg=')
+        ? decodeURIComponent(href.split('uddg=')[1].split('&')[0])
+        : href;
+      results.push({
+        title: titleEl.text.trim(),
+        url: realUrl,
+        snippet: snippetEl ? snippetEl.text.trim() : '',
+      });
+    });
+
+    res.json({ results: results.slice(0, 8), query: q });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
